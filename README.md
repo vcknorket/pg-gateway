@@ -498,6 +498,77 @@ _/etc/hosts_
 
 On Windows this file lives at `C:\Windows\System32\Drivers\etc\hosts`.
 
+### WebSocket Gateway
+
+This example demonstrates a more complex use case where `pg-gateway` acts as a protocol-translating gateway in front of a non-Postgres backend. The gateway accepts connections from a standard PostgreSQL client, but forwards the queries over a WebSocket to a backend worker process for execution.
+
+This architecture is useful for:
+- Exposing a modern, web-native API (like a data API with a Python worker) to traditional database tools that speak the PostgreSQL protocol.
+- Offloading long-running queries to a scalable, asynchronous worker pool.
+
+The example in `examples/websocket-gateway` is a self-contained test that simulates the entire flow within a single script (`run-test.ts`).
+
+#### Architecture
+
+The data flows through the system as follows:
+
+1.  A PostgreSQL client (e.g., `psql`) connects to the `pg-gateway` server.
+2.  The gateway handles the PostgreSQL handshake and authentication. For each client, it establishes a persistent WebSocket connection to a backend worker.
+3.  When the client sends a query, the gateway wraps it in a JSON payload and sends it to the worker over the WebSocket.
+4.  The worker receives the job, executes the query against a data engine (simulated in this example), and sends the results back over the WebSocket.
+5.  The gateway receives the result payload, translates it into the proper PostgreSQL wire protocol format (`RowDescription`, `DataRow`, etc.), and sends it back to the client.
+
+#### Payload Structure
+
+The communication between the gateway and the worker uses a simple JSON-based protocol with a versioned schema.
+
+**Gateway to Worker (`Job`):**
+The gateway sends the user's credentials and query to the worker.
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "queryId": "a-unique-uuid-for-tracking",
+  "query": "SELECT * FROM users;",
+  "user": "the-pg-user",
+  "password": "the-pg-password"
+}
+```
+
+**Worker to Gateway (`WorkerResult`):**
+The worker sends a result payload back, which can represent either a successful query or an error.
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "queryId": "the-same-uuid-for-correlation",
+  "status": "success",
+  "payload": {
+    "columns": [
+      { "name": "id", "typeOID": 23 },
+      { "name": "name", "typeOID": 25 }
+    ],
+    "rows": [
+      ["1", "Alice"],
+      ["2", null]
+    ],
+    "commandTag": "SELECT 2"
+  }
+}
+```
+
+#### Running the Example
+
+The example includes a comprehensive, self-contained integration test. To run it, navigate to the example directory and execute the test script:
+
+```shell
+cd examples/websocket-gateway
+npm install
+npm test
+```
+
+This will start the gateway, a simulated worker, and a test client that runs a series of queries to validate the functionality, including error handling and connection resilience.
+
 ## Development
 
 ```shell
