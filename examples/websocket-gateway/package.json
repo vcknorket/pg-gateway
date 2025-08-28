@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "description": "A robust example of using pg-gateway to proxy requests to a backend via WebSockets.",
-  "main": "index.ts",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "tsx index.ts",
-    "test": "tsx run-test.ts"
+    "start": "node dist/index.js",
+    "test": "tsx run-test.ts",
+    "build": "tsc"
   },
   "dependencies": {
     "ws": "^8.17.0",

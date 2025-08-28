@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-gateway-deployment
+  labels:
+    app: pg-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: pg-gateway
+  template:
+    metadata:
+      labels:
+        app: pg-gateway
+    spec:
+      containers:
+      - name: pg-gateway
+        # IMPORTANT: Replace this with the actual name of the image you build and push
+        # to your container registry (e.g., Docker Hub, GCR, ECR).
+        image: your-registry/pg-gateway:latest
+        ports:
+        - containerPort: 5432
+          name: pg-port
+        env:
+        # Example of overriding the default worker URL.
+        # This should point to the internal service name of your worker deployment.
+        - name: WORKER_URL
+          value: "ws://worker-deployment-service:8080"
+        - name: PG_PORT
+          value: "5432"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "250m"

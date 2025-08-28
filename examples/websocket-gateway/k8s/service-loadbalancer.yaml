@@ -1,0 +1,17 @@
+# This manifest is suitable for cloud environments (GKE, EKS, AKS, etc.)
+# where creating a Service of type LoadBalancer will automatically provision
+# an external L4 network load balancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-gateway-loadbalancer
+spec:
+  type: LoadBalancer
+  selector:
+    app: pg-gateway
+  ports:
+    - protocol: TCP
+      # This is the external port the load balancer will listen on.
+      port: 5432
+      # This is the port on the pods that the service will forward traffic to.
+      targetPort: pg-port

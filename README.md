@@ -569,6 +569,42 @@ npm test
 
 This will start the gateway, a simulated worker, and a test client that runs a series of queries to validate the functionality, including error handling and connection resilience.
 
+#### Containerization & Kubernetes Deployment
+
+The `websocket-gateway` example also includes files to containerize and deploy the application to Kubernetes.
+
+**1. Build the Docker Image**
+
+A multi-stage `Dockerfile` is provided to build an optimized, production-ready image. To build it, run the following command from the root of the repository:
+
+```shell
+docker build -t your-registry/pg-gateway:latest -f examples/websocket-gateway/Dockerfile .
+```
+Replace `your-registry/pg-gateway:latest` with the name and tag you want for your image.
+
+**2. Push the Image**
+
+Push the newly built image to your container registry:
+```shell
+docker push your-registry/pg-gateway:latest
+```
+
+**3. Deploy to Kubernetes**
+
+The `examples/websocket-gateway/k8s` directory contains Kubernetes manifests. Before applying them, you must edit `deployment.yaml` and change the `image` field to match the image you just pushed.
+
+Once updated, apply the manifests:
+```shell
+# Deploy the application
+kubectl apply -f examples/websocket-gateway/k8s/deployment.yaml
+kubectl apply -f examples/websocket-gateway/k8s/service.yaml
+
+# Expose the service to external traffic
+kubectl apply -f examples/websocket-gateway/k8s/service-loadbalancer.yaml
+```
+
+This will deploy the gateway and expose it via a cloud provider's network load balancer on port 5432. Note that exposing TCP services via Ingress can be more complex and may require specific configurations for your Ingress controller. Using a `LoadBalancer` service is often the most straightforward method on cloud platforms.
+
 ## Development
 
 ```shell
