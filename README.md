@@ -520,42 +520,56 @@ The data flows through the system as follows:
 
 #### Payload Structure
 
-The communication between the gateway and the worker uses a simple JSON-based protocol with a versioned schema.
+The communication between the gateway and the worker uses a streaming, JSON-based protocol.
 
 **Gateway to Worker (`Job`):**
-The gateway sends the user's credentials and query to the worker.
+The gateway sends the user's credentials (as `api_key` and `access_token`) and the SQL query. The worker is responsible for generating a `query_id` to track the request.
 
 ```json
 {
-  "schemaVersion": "1.0.0",
-  "queryId": "a-unique-uuid-for-tracking",
-  "query": "SELECT * FROM users;",
-  "user": "the-pg-user",
-  "password": "the-pg-password"
+  "api_key": "the-pg-user",
+  "access_token": "the-pg-password",
+  "query": "SELECT * FROM users;"
 }
 ```
 
-**Worker to Gateway (`WorkerResult`):**
-The worker sends a result payload back, which can represent either a successful query or an error.
+**Worker to Gateway (Streaming Response):**
+For a single query, the worker sends a sequence of messages.
 
-```json
-{
-  "schemaVersion": "1.0.0",
-  "queryId": "the-same-uuid-for-correlation",
-  "status": "success",
-  "payload": {
-    "columns": [
-      { "name": "id", "typeOID": 23 },
-      { "name": "name", "typeOID": 25 }
-    ],
-    "rows": [
-      ["1", "Alice"],
-      ["2", null]
-    ],
-    "commandTag": "SELECT 2"
-  }
-}
-```
+1.  **`schema` message (once, first):** Describes the result columns.
+    ```json
+    {
+      "query_id": "a-uuid-generated-by-the-worker",
+      "type": "schema",
+      "payload": {
+        "columns": [ { "name": "id", "typeOID": 23 }, { "name": "name", "typeOID": 25 } ]
+      }
+    }
+    ```
+2.  **`data` messages (zero or more):** Contains batches of row data.
+    ```json
+    {
+      "query_id": "a-uuid-generated-by-the-worker",
+      "type": "data",
+      "payload": [ ["1", "Alice"], ["2", null] ]
+    }
+    ```
+3.  **`complete` message (once, last):** Signals the end of a successful query.
+    ```json
+    {
+      "query_id": "a-uuid-generated-by-the-worker",
+      "type": "complete",
+      "payload": { "commandTag": "SELECT 2", "total_rows": 2 }
+    }
+    ```
+4.  **`error` message (alternative):** If the query fails, a single `error` message is sent instead.
+    ```json
+    {
+      "query_id": "a-uuid-generated-by-the-worker",
+      "type": "error",
+      "payload": { "message": "An error occurred.", "code": "XX000" }
+    }
+    ```
 
 #### Running the Example
 
