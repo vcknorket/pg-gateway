@@ -104,17 +104,26 @@ export function createGateway(): Server {
                     const query = data.toString('utf8', 5, data.length - 1);
                     console.log(`[Gateway] Received query: "${query}"`);
 
+                    console.log(`[Gateway] Checking WS state before query: ${ws.readyState} (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)`);
                     if (ws.readyState !== WebSocket.OPEN) {
                         connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.CONNECTION_FAILURE, message: 'Gateway is not connected to the backend worker. Please try again.' });
                         connection.sendReadyForQuery();
                         return true;
                     }
 
-                    if (query.split(';').filter(s => s.trim() !== '').length > 1) {
-                         connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.SYNTAX_ERROR, message: 'Multi-statement queries are not supported.' });
-                         connection.sendReadyForQuery();
-                         return true;
+                    // --- Fast-path for version query ---
+                    const lq = query.trim().toLowerCase();
+                    if (lq.startsWith('select version()')) {
+                        sendRowDescription(connection, [{ name: 'version', typeOID: 25 }]);
+                        sendDataRow(connection, [`${connection.options.serverVersion} (via pg-gateway)`]);
+                        sendCommandComplete(connection, 'SELECT 1');
+                        connection.sendReadyForQuery();
+                        return true;
                     }
+
+                    // Multi-statement query detection is complex due to strings and comments.
+                    // A simple check can have false positives. For this MVP, we are omitting
+                    // the check, but a production system would need a more robust parser.
 
                     const queryId = randomUUID();
                     const job: Job = { schemaVersion: SCHEMA_VERSION, queryId, query, user: credentialsStore.user, password: credentialsStore.password };
@@ -123,12 +132,19 @@ export function createGateway(): Server {
                         responseEmitter.once(queryId, resolve);
                     });
 
-                    // --- Robustness: Query Timeout ---
-                    const timeoutPromise = new Promise<never>((_, reject) =>
-                        setTimeout(() => reject(new Error('Timed out waiting for worker response.')), QUERY_TIMEOUT_MS)
-                    );
-
                     try {
+                        // --- Graceful Connect: Wait for WS to be open ---
+                        await waitWsOpen(ws);
+
+                        const resultPromise = new Promise<WorkerResult>((resolve) => {
+                            responseEmitter.once(queryId, resolve);
+                        });
+
+                        // --- Robustness: Query Timeout ---
+                        const timeoutPromise = new Promise<never>((_, reject) =>
+                            setTimeout(() => reject(new Error('Timed out waiting for worker response.')), QUERY_TIMEOUT_MS)
+                        );
+
                         wsSendSafe(ws, job);
                         const result = await Promise.race([resultPromise, timeoutPromise]);
 
@@ -140,9 +156,10 @@ export function createGateway(): Server {
                                 sendRowDescription(connection, columns);
                                 if (rows) rows.forEach((row) => sendDataRow(connection, row));
                             }
-                            sendCommandComplete(connection, commandTag || '');
+                            sendCommandComplete(connection, commandTag || 'SELECT 0');
                         }
                     } catch (err) {
+                        // This single catch block now handles errors from waitWsOpen, wsSendSafe, and the query timeout.
                         connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.QUERY_CANCELED, message: (err as Error).message });
                     }
 
@@ -172,14 +189,14 @@ export function createGateway(): Server {
         ws.on('close', () => {
             console.log('[Gateway] WebSocket connection closed.');
             clearInterval(pingInterval); // Graceful teardown
-            if (!socket.destroyed) socket.end();
+            // Do NOT end the PG socket. The session remains alive.
         });
 
         ws.on('error', (err) => {
             console.error('[Gateway] WebSocket error:', err);
             clearInterval(pingInterval); // Graceful teardown
-            connection.sendError({ severity: 'FATAL', code: '08000', message: 'Gateway could not communicate with the backend worker.' });
-            if (!socket.destroyed) socket.end();
+            // Do not send a FATAL error or end the PG socket.
+            // Future queries will fail gracefully due to the readyState check.
         });
 
         socket.on('close', () => {
@@ -193,9 +210,32 @@ export function createGateway(): Server {
     return server;
 }
 
-// --- Robustness: Backpressure Handling ---
+// --- Robustness: Backpressure Handling & Graceful Connect ---
+async function waitWsOpen(ws: WebSocket, ms = 2000): Promise<void> {
+    if (ws.readyState === WebSocket.OPEN) return;
+    if (ws.readyState !== WebSocket.CONNECTING) throw new Error('Worker socket is not connecting.');
+
+    return new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timed out waiting for worker to connect.')), ms);
+        // Both 'open' and 'error' events should resolve the promise
+        const onOpen = () => {
+            clearTimeout(timeout);
+            ws.removeListener('error', onError);
+            resolve();
+        };
+        const onError = (err: Error) => {
+            clearTimeout(timeout);
+            ws.removeListener('open', onOpen);
+            reject(err);
+        };
+        ws.once('open', onOpen);
+        ws.once('error', onError);
+    });
+}
+
 function wsSendSafe(ws: WebSocket, payload: any) {
     if (ws.readyState !== WebSocket.OPEN) {
+        // This should not be hit if waitWsOpen is used, but serves as a final guard.
         throw new Error('Worker not connected');
     }
     if (ws.bufferedAmount > WS_MAX_BUFFERED_AMOUNT) {
