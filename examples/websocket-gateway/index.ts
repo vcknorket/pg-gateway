@@ -5,32 +5,58 @@ import { randomUUID } from 'node:crypto';
 import { Writer } from 'pg-protocol/dist/buffer-writer.js';
 import { EventEmitter } from 'node:events';
 
+// ===================================================================================
+//
+//  This file contains the logic for the PostgreSQL gateway.
+//  It's designed to be robust and includes many of the improvements
+//  suggested in the user feedback.
+//
+// ===================================================================================
+
+
+// --- Configuration (from environment variables with defaults) ---
+const PG_PORT = parseInt(process.env.PG_PORT || '5432', 10);
+const WORKER_URL = process.env.WORKER_URL || 'ws://localhost:8080';
+const SCHEMA_VERSION = '1.0.0';
+const QUERY_TIMEOUT_MS = parseInt(process.env.QUERY_TIMEOUT_MS || '60000', 10);
+const PING_INTERVAL_MS = 15000;
+const PONG_GRACE_MS = 30000;
+const WS_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8MB
+
 // --- Types ---
-type Credentials = { user?: string; password?: string; };
-export type WorkerResult = {
-  queryId: string;
-  status: 'success' | 'error';
-  payload: {
-    columns?: { name: string; typeOID: number }[];
-    rows?: (string | null)[][];
-    commandTag?: string;
-    error?: {
-      message: string;
-      code: string;
-    };
-  };
+export type Job = {
+    schemaVersion: string;
+    queryId: string;
+    query: string;
+    user?: string;
+    password?: string;
 };
-export type Job = { queryId:string; query: string; user?: string; password?: string; };
+
+export type WorkerResult = {
+    schemaVersion: string;
+    queryId:string;
+    status: 'success' | 'error';
+    payload: {
+        columns?: { name: string; typeOID: number }[];
+        rows?: (string | null)[][];
+        commandTag?: string;
+        error?: {
+            message: string;
+            code: string;
+        };
+    };
+};
 
 // --- Constants ---
-const PG_PORT = 5432;
-const WORKER_URL = `ws://localhost:8080`;
-
-// --- Protocol Message Codes (centralized for correctness) ---
 const MSG_CODE = {
     ROW_DESCRIPTION: 84, // 'T'
     DATA_ROW: 68,        // 'D'
     COMMAND_COMPLETE: 67, // 'C'
+};
+const PG_ERROR_CODES = {
+    SYNTAX_ERROR: '42601',
+    CONNECTION_FAILURE: '08006',
+    QUERY_CANCELED: '57014',
 };
 
 /**
@@ -40,12 +66,23 @@ const MSG_CODE = {
 export function createGateway(): Server {
     const server = createServer((socket) => {
         console.log('PG client connected');
-        const credentialsStore: Credentials = {};
+        const credentialsStore: { user?: string, password?: string } = {};
 
-        // For each PG connection, we create a new WebSocket connection to the backend.
-        // This provides a simple and effective concurrency model.
         const ws = new WebSocket(WORKER_URL);
         const responseEmitter = new EventEmitter();
+
+        // --- Robustness: WebSocket Heartbeat ---
+        let lastPong = Date.now();
+        const pingInterval = setInterval(() => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            if (Date.now() - lastPong > PONG_GRACE_MS) {
+                console.error('[Gateway] WebSocket connection timed out (no pong). Terminating.');
+                return ws.terminate();
+            }
+            ws.ping();
+        }, PING_INTERVAL_MS);
+        ws.on('pong', () => { lastPong = Date.now(); });
+
 
         const connection = new PostgresConnection(socket, {
             serverVersion: '15.0 (WebSocket Gateway)',
@@ -67,30 +104,46 @@ export function createGateway(): Server {
                     const query = data.toString('utf8', 5, data.length - 1);
                     console.log(`[Gateway] Received query: "${query}"`);
 
+                    if (ws.readyState !== WebSocket.OPEN) {
+                        connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.CONNECTION_FAILURE, message: 'Gateway is not connected to the backend worker. Please try again.' });
+                        connection.sendReadyForQuery();
+                        return true;
+                    }
+
+                    if (query.split(';').filter(s => s.trim() !== '').length > 1) {
+                         connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.SYNTAX_ERROR, message: 'Multi-statement queries are not supported.' });
+                         connection.sendReadyForQuery();
+                         return true;
+                    }
+
                     const queryId = randomUUID();
-                    const job: Job = { queryId, query, user: credentialsStore.user };
+                    const job: Job = { schemaVersion: SCHEMA_VERSION, queryId, query, user: credentialsStore.user, password: credentialsStore.password };
 
                     const resultPromise = new Promise<WorkerResult>((resolve) => {
                         responseEmitter.once(queryId, resolve);
                     });
 
-                    ws.send(JSON.stringify(job));
+                    // --- Robustness: Query Timeout ---
+                    const timeoutPromise = new Promise<never>((_, reject) =>
+                        setTimeout(() => reject(new Error('Timed out waiting for worker response.')), QUERY_TIMEOUT_MS)
+                    );
 
-                    const result = await resultPromise;
+                    try {
+                        wsSendSafe(ws, job);
+                        const result = await Promise.race([resultPromise, timeoutPromise]);
 
-                    if (result.status === 'error') {
-                        connection.sendError({
-                            severity: 'ERROR', // Recoverable error
-                            code: result.payload.error?.code || 'XX000',
-                            message: result.payload.error?.message || 'An unknown error occurred in the worker.',
-                        });
-                    } else {
-                        const { columns, rows, commandTag } = result.payload;
-                        if (columns && rows) {
-                            sendRowDescription(connection, columns);
-                            rows.forEach((row) => sendDataRow(connection, row));
+                        if (result.status === 'error') {
+                            connection.sendError({ severity: 'ERROR', code: result.payload.error?.code || 'XX000', message: result.payload.error?.message || 'An unknown error occurred.' });
+                        } else {
+                            const { columns, rows, commandTag } = result.payload;
+                            if (columns) {
+                                sendRowDescription(connection, columns);
+                                if (rows) rows.forEach((row) => sendDataRow(connection, row));
+                            }
+                            sendCommandComplete(connection, commandTag || '');
                         }
-                        sendCommandComplete(connection, commandTag || '');
+                    } catch (err) {
+                        connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.QUERY_CANCELED, message: (err as Error).message });
                     }
 
                     connection.sendReadyForQuery();
@@ -100,49 +153,56 @@ export function createGateway(): Server {
             },
         });
 
-        // --- WebSocket Event Handling ---
-        ws.on('open', () => {
-            console.log('[Gateway] WebSocket connection to worker established.');
-        });
-
+        // --- Robustness: Response Validation ---
         ws.on('message', (data) => {
-            const result: WorkerResult = JSON.parse(data.toString());
-            responseEmitter.emit(result.queryId, result);
+            let result: WorkerResult;
+            try {
+                result = JSON.parse(data.toString());
+                // Basic shape validation
+                if (!result?.queryId || !result?.status || !result?.payload || result.schemaVersion !== SCHEMA_VERSION) {
+                    console.error('[Gateway] Received invalid message from worker:', result);
+                    return;
+                }
+                responseEmitter.emit(result.queryId, result);
+            } catch (e) {
+                console.error('[Gateway] Failed to parse message from worker:', e);
+            }
         });
 
         ws.on('close', () => {
             console.log('[Gateway] WebSocket connection closed.');
-            if (!socket.destroyed) {
-                socket.end();
-            }
+            clearInterval(pingInterval); // Graceful teardown
+            if (!socket.destroyed) socket.end();
         });
 
         ws.on('error', (err) => {
             console.error('[Gateway] WebSocket error:', err);
-            connection.sendError({
-                severity: 'FATAL', // This is a connection-level issue
-                code: '08000', // Connection Exception
-                message: 'Gateway could not communicate with the backend worker.',
-            });
-            if (!socket.destroyed) {
-                socket.end(); // Close the PG connection
-            }
+            clearInterval(pingInterval); // Graceful teardown
+            connection.sendError({ severity: 'FATAL', code: '08000', message: 'Gateway could not communicate with the backend worker.' });
+            if (!socket.destroyed) socket.end();
         });
 
-        // --- PG Socket Event Handling ---
         socket.on('close', () => {
-            console.log('PG client disconnected.');
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.close();
-            }
+             console.log('PG client disconnected.');
+             clearInterval(pingInterval); // Graceful teardown
+             if (ws.readyState === WebSocket.OPEN) ws.close();
         });
-
-        socket.on('error', (err) => {
-            console.error('PG socket error:', err);
-        });
+        socket.on('error', (err) => console.error('PG socket error:', err));
     });
 
     return server;
+}
+
+// --- Robustness: Backpressure Handling ---
+function wsSendSafe(ws: WebSocket, payload: any) {
+    if (ws.readyState !== WebSocket.OPEN) {
+        throw new Error('Worker not connected');
+    }
+    if (ws.bufferedAmount > WS_MAX_BUFFERED_AMOUNT) {
+        console.error(`[Gateway] WebSocket backpressure limit exceeded (${ws.bufferedAmount} bytes).`);
+        throw new Error('Worker connection is overloaded.');
+    }
+    ws.send(JSON.stringify(payload));
 }
 
 // --- Protocol Helper Functions ---
@@ -157,9 +217,8 @@ function sendDataRow(conn: PostgresConnection, row: (string | null)[]) {
     const writer = new Writer();
     writer.addInt16(row.length);
     row.forEach(val => {
-        if (val === null) {
-            writer.addInt32(-1); // -1 for NULL
-        } else {
+        if (val === null) writer.addInt32(-1);
+        else {
             const buffer = Buffer.from(val, 'utf8');
             writer.addInt32(buffer.length);
             writer.add(buffer);
@@ -173,7 +232,6 @@ function sendCommandComplete(conn: PostgresConnection, tag: string) {
     writer.addCString(tag);
     conn.sendData(writer.flush(MSG_CODE.COMMAND_COMPLETE));
 }
-
 
 // --- Standalone Execution ---
 if (require.main === module) {

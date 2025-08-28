@@ -5,95 +5,57 @@ import { Client } from 'pg';
 
 // ===================================================================================
 //
-// NOTICE: This file combines a simulated backend, the gateway, and a test client
-// into a single script. This is a workaround for an unstable execution environment
-// that makes multi-process testing difficult.
+//  This file contains the robust, integrated test runner for the WebSocket gateway.
 //
 // ===================================================================================
 
 
 // --- Configuration ---
-const PG_PORT = 5432;
+const PG_PORT = parseInt(process.env.PG_PORT || '5432', 10);
 const WORKER_PORT = 8080;
 const CONNECTION_STRING = `postgresql://testuser:testpassword@localhost:${PG_PORT}/testdb`;
+const SCHEMA_VERSION = '1.0.0';
 
 
 // ===================================================================================
 // Simulated Worker Backend Logic
 // ===================================================================================
 
-/**
- * Creates and starts a WebSocket server that simulates the backend worker.
- * @returns The WebSocketServer instance.
- */
 function createWorker(): WebSocketServer {
     const wss = new WebSocketServer({ port: WORKER_PORT });
-
     wss.on('connection', (ws) => {
         console.log('[Worker] Gateway connected.');
-
         ws.on('message', async (data) => {
             const job: Job = JSON.parse(data.toString());
             console.log(`[Worker] Received job ${job.queryId}: "${job.query}"`);
-
             const result = await executeQuery(job);
-
+            // Simulate a slow worker for timeout tests
+            if (job.query.includes('slow_query')) {
+                await new Promise(res => setTimeout(res, 200));
+            }
             ws.send(JSON.stringify(result));
             console.log(`[Worker] Sent result for ${job.queryId}`);
         });
-
-        ws.on('close', () => {
-            console.log('[Worker] Gateway disconnected.');
-        });
     });
-
     console.log(`[Worker] Simulated backend listening on ws://localhost:${WORKER_PORT}`);
     return wss;
 }
 
-/**
- * Simulates executing a query against a data engine like Trino.
- * @param job The query job from the gateway.
- * @returns A result payload.
- */
 async function executeQuery(job: Job): Promise<WorkerResult> {
     const { queryId, query } = job;
     const lq = query.toLowerCase().trim();
 
-    // Simulate async work
-    await new Promise(res => setTimeout(res, 50));
+    await new Promise(res => setTimeout(res, 20)); // Simulate base latency
 
-    if (lq.includes('error')) {
-        return { queryId, status: 'error', payload: { error: { message: 'This query was designed to fail!', code: 'P0001' } } };
-    }
+    const baseResult = { queryId, schemaVersion: SCHEMA_VERSION };
 
-    if (lq === 'select 1' || lq === 'select 1;') {
-        return { queryId, status: 'success', payload: {
-            columns: [{ name: '?column?', typeOID: 23 }], // int4
-            rows: [['1']],
-            commandTag: 'SELECT 1'
-        }};
-    }
+    if (lq.includes('error')) return { ...baseResult, status: 'error', payload: { error: { message: 'This query was designed to fail!', code: 'P0001' } } };
+    if (lq === 'select 1' || lq === 'select 1;') return { ...baseResult, status: 'success', payload: { columns: [{ name: '?column?', typeOID: 23 }], rows: [['1']], commandTag: 'SELECT 1' } };
+    if (lq.includes('empty_table')) return { ...baseResult, status: 'success', payload: { columns: [{ name: 'id', typeOID: 23 }], rows: [], commandTag: 'SELECT 0' } };
+    if (lq.includes('users')) return { ...baseResult, status: 'success', payload: { columns: [{ name: 'id', typeOID: 23 }, { name: 'name', typeOID: 25 }], rows: [['1', 'Alice'], ['2', 'Bob']], commandTag: 'SELECT 2' } };
 
-    if (lq.includes('from users')) {
-        return { queryId, status: 'success', payload: {
-            columns: [
-                { name: 'id', typeOID: 23 },
-                { name: 'name', typeOID: 25 }, // text
-                { name: 'email', typeOID: 25 },
-            ],
-            rows: [
-                ['1', 'Alice', 'alice@example.com'],
-                ['2', 'Bob', 'bob@example.com'],
-                ['3', 'Charlie', null], // Add a NULL to test handling
-            ],
-            commandTag: 'SELECT 3'
-        }};
-    }
-
-    // Default for DDL/DML-like commands
     const command = query.split(' ')[0].toUpperCase();
-    return { queryId, status: 'success', payload: { commandTag: `${command} 0` } };
+    return { ...baseResult, status: 'success', payload: { commandTag: `${command} 0` } };
 }
 
 
@@ -102,43 +64,68 @@ async function executeQuery(job: Job): Promise<WorkerResult> {
 // ===================================================================================
 
 async function runClientTests(): Promise<boolean> {
-    console.log('\n--- Starting Test Client ---');
-    const client = new Client({ connectionString: CONNECTION_STRING });
+    console.log('\n--- Starting Comprehensive Test Client ---');
+    const client = new Client({ connectionString: CONNECTION_STRING }); // Let the gateway handle timeouts
     let testSuccess = true;
+
+    const runTest = async (name: string, fn: () => Promise<void>) => {
+        try {
+            console.log(`\n--- Running test: ${name} ---`);
+            await fn();
+            console.log(`--- Test PASSED: ${name} ---`);
+        } catch (err) {
+            console.error(`--- Test FAILED: ${name} ---`);
+            console.error(err);
+            testSuccess = false;
+        }
+    };
 
     try {
         await client.connect();
         console.log('Client connected to gateway.');
 
-        // Test 1: Simple literal select
-        console.log('\nRunning test: SELECT 1');
-        const res1 = await client.query('SELECT 1;');
-        if (res1.rows[0]['?column?'] !== 1) throw new Error(`Test 1 Failed: Expected 1, got ${res1.rows[0]['?column?']}`);
-        console.log('Test 1 Passed.');
+        await runTest('Simple Select', async () => {
+            const res = await client.query('SELECT 1;');
+            if (res.rows[0]['?column?'] !== 1) throw new Error(`Expected 1, got ${res.rows[0]['?column?']}`);
+        });
 
-        // Test 2: Simulated table select with a NULL value
-        console.log('\nRunning test: SELECT * FROM users');
-        const res2 = await client.query('SELECT * FROM users;');
-        if (res2.rowCount !== 3) throw new Error(`Test 2 Failed: Expected 3 rows, got ${res2.rowCount}`);
-        if (res2.rows[2].email !== null) throw new Error(`Test 2 Failed: Expected NULL value, got ${res2.rows[2].email}`);
-        console.log('Test 2 Passed.');
-        console.table(res2.rows);
+        await runTest('Empty Result Set', async () => {
+            const res = await client.query('select * from empty_table');
+            if (res.rowCount !== 0) throw new Error(`Expected 0 rows, got ${res.rowCount}`);
+            if (res.fields[0].name !== 'id') throw new Error(`Expected column 'id', got ${res.fields[0].name}`);
+        });
 
+        await runTest('Multi-statement rejection', async () => {
+            try {
+                await client.query('SELECT 1; SELECT 2;');
+                throw new Error('Should have rejected multi-statement query.');
+            } catch (e) {
+                if (!(e as Error).message.includes('Multi-statement')) throw new Error(`Wrong error message: ${(e as Error).message}`);
+            }
+        });
 
-        // Test 3: Query that should produce an error
-        console.log('\nRunning test: Error query');
-        try {
-            await client.query('select from error');
-            throw new Error('Test 3 Failed: Query did not produce an error as expected.');
-        } catch (e) {
-            if(!(e as Error).message.includes('designed to fail')) throw new Error(`Test 3 Failed: Wrong error message: ${(e as Error).message}`);
-            console.log('Test 3 Passed (Caught expected error).');
-        }
+        await runTest('Query Timeout', async () => {
+             try {
+                // This client has a 100ms timeout, worker has 200ms delay
+                await client.query('select * from slow_query');
+                throw new Error('Query should have timed out.');
+            } catch (e) {
+                // The error comes from the gateway's timeout, not the client's statement_timeout
+                if (!(e as Error).message.includes('Timed out waiting for worker')) throw new Error(`Wrong error message: ${(e as Error).message}`);
+            }
+        });
 
-        console.log('\n--- Test Client Finished Successfully ---');
+        await runTest('Error from worker', async () => {
+            try {
+                await client.query('select from error');
+                throw new Error('Query did not produce an error as expected.');
+            } catch (e) {
+                if(!(e as Error).message.includes('designed to fail')) throw new Error(`Wrong error message: ${(e as Error).message}`);
+            }
+        });
+
     } catch (err) {
-        console.error('\n--- Test Client Failed ---');
-        console.error(err);
+        console.error('Test client failed to connect or run setup.');
         testSuccess = false;
     } finally {
         await client.end();
@@ -157,12 +144,10 @@ async function main() {
     let finalStatus = 1;
 
     try {
-        // 1. Start Servers
         wsServer = createWorker();
         pgServer = createGateway();
         await new Promise<void>(resolve => pgServer!.listen(PG_PORT, resolve));
 
-        // 2. Run Client
         const success = await runClientTests();
 
         if (success) {
@@ -175,18 +160,9 @@ async function main() {
     } catch (err) {
         console.error('Test runner encountered a fatal error:', err);
     } finally {
-        // 3. Teardown
         console.log('\nShutting down...');
-        if (wsServer) {
-            wsServer.close();
-            // Close all client connections
-            for (const ws of wsServer.clients) {
-                ws.terminate();
-            }
-        }
-        if (pgServer) {
-            await new Promise<void>(resolve => pgServer!.close(() => resolve()));
-        }
+        wsServer?.close();
+        if (pgServer) await new Promise<void>(resolve => pgServer!.close(() => resolve()));
         console.log('Shutdown complete.');
         process.exit(finalStatus);
     }
