@@ -1,15 +1,12 @@
 import { createServer, Server } from 'node:net';
 import { PostgresConnection, FrontendMessageCode } from 'pg-gateway';
 import WebSocket from 'ws';
-import { randomUUID } from 'node:crypto';
 import { Writer } from 'pg-protocol/dist/buffer-writer.js';
-import { EventEmitter } from 'node:events';
 
 // ===================================================================================
 //
-//  This file contains the logic for the PostgreSQL gateway.
-//  It's designed to be robust and includes many of the improvements
-//  suggested in the user feedback.
+//  This file contains the logic for the PostgreSQL gateway, refactored to support
+//  a streaming WebSocket protocol.
 //
 // ===================================================================================
 
@@ -17,35 +14,36 @@ import { EventEmitter } from 'node:events';
 // --- Configuration (from environment variables with defaults) ---
 const PG_PORT = parseInt(process.env.PG_PORT || '5432', 10);
 const WORKER_URL = process.env.WORKER_URL || 'ws://localhost:8080';
-const SCHEMA_VERSION = '1.0.0';
-const QUERY_TIMEOUT_MS = parseInt(process.env.QUERY_TIMEOUT_MS || '60000', 10);
-const PING_INTERVAL_MS = 15000;
-const PONG_GRACE_MS = 30000;
-const WS_MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8MB
 
-// --- Types ---
+// --- Types for new WebSocket Protocol ---
 export type Job = {
-    schemaVersion: string;
-    queryId: string;
+    api_key: string;
+    access_token: string;
     query: string;
-    user?: string;
-    password?: string;
 };
 
-export type WorkerResult = {
-    schemaVersion: string;
-    queryId:string;
-    status: 'success' | 'error';
-    payload: {
-        columns?: { name: string; typeOID: number }[];
-        rows?: (string | null)[][];
-        commandTag?: string;
-        error?: {
-            message: string;
-            code: string;
-        };
-    };
+export type WorkerSchema = {
+    columns: { name: string; typeOID: number }[];
 };
+
+export type WorkerData = (string | null)[][];
+
+export type WorkerComplete = {
+    commandTag: string;
+    total_rows: number;
+};
+
+export type WorkerError = {
+    message: string;
+    code: string;
+};
+
+export type WorkerMessage = {
+    query_id: string;
+    type: 'schema' | 'data' | 'complete' | 'error';
+    payload: WorkerSchema | WorkerData | WorkerComplete | WorkerError;
+};
+
 
 // --- Constants ---
 const MSG_CODE = {
@@ -54,49 +52,32 @@ const MSG_CODE = {
     COMMAND_COMPLETE: 67, // 'C'
 };
 const PG_ERROR_CODES = {
-    SYNTAX_ERROR: '42601',
     CONNECTION_FAILURE: '08006',
-    QUERY_CANCELED: '57014',
 };
 
-/**
- * Creates and configures the PostgreSQL gateway server.
- * @returns A Node.js `net.Server` instance.
- */
+// --- Main Gateway Logic ---
 export function createGateway(): Server {
     const server = createServer((socket) => {
-        console.log('PG client connected');
-        const credentialsStore: { user?: string, password?: string } = {};
+        const credentialsStore: { user?: string; password?: string } = {};
+
+        // The state for the current, single in-flight query on this connection.
+        // A more advanced implementation would use a Map to handle multiple in-flight queries.
+        let inFlightQuery: {
+            isSchemaSent: boolean;
+            resolve: () => void;
+            reject: (err: Error) => void;
+        } | null = null;
 
         const ws = new WebSocket(WORKER_URL);
-        const responseEmitter = new EventEmitter();
-
-        // --- Robustness: WebSocket Heartbeat ---
-        let lastPong = Date.now();
-        const pingInterval = setInterval(() => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-            if (Date.now() - lastPong > PONG_GRACE_MS) {
-                console.error('[Gateway] WebSocket connection timed out (no pong). Terminating.');
-                return ws.terminate();
-            }
-            ws.ping();
-        }, PING_INTERVAL_MS);
-        ws.on('pong', () => { lastPong = Date.now(); });
-
 
         const connection = new PostgresConnection(socket, {
-            serverVersion: '15.0 (WebSocket Gateway)',
+            serverVersion: '15.0 (Streaming Gateway)',
             authMode: 'cleartextPassword',
-
             validateCredentials: (credentials) => {
-                if (credentials.authMode === 'cleartextPassword') {
-                    credentialsStore.user = credentials.user;
-                    credentialsStore.password = credentials.password;
-                    return true;
-                }
-                return false;
+                credentialsStore.user = credentials.user;
+                credentialsStore.password = credentials.password;
+                return true;
             },
-
             onMessage: async (data, state) => {
                 if (!state.isAuthenticated) return false;
 
@@ -104,146 +85,96 @@ export function createGateway(): Server {
                     const query = data.toString('utf8', 5, data.length - 1);
                     console.log(`[Gateway] Received query: "${query}"`);
 
-                    console.log(`[Gateway] Checking WS state before query: ${ws.readyState} (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)`);
                     if (ws.readyState !== WebSocket.OPEN) {
-                        connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.CONNECTION_FAILURE, message: 'Gateway is not connected to the backend worker. Please try again.' });
+                        connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.CONNECTION_FAILURE, message: 'Backend worker is not connected.' });
                         connection.sendReadyForQuery();
                         return true;
                     }
 
-                    // --- Fast-path for version query ---
-                    const lq = query.trim().toLowerCase();
-                    if (lq.startsWith('select version()')) {
-                        sendRowDescription(connection, [{ name: 'version', typeOID: 25 }]);
-                        sendDataRow(connection, [`${connection.options.serverVersion} (via pg-gateway)`]);
-                        sendCommandComplete(connection, 'SELECT 1');
+                    const job: Partial<Job> = {
+                        api_key: credentialsStore.user,
+                        access_token: credentialsStore.password,
+                        query: query,
+                    };
+
+                    // Wait for the current query to complete before sending the next one.
+                    if (inFlightQuery) {
+                        connection.sendError({ severity: 'ERROR', code: '55P03', message: 'Gateway is busy with another query.' });
                         connection.sendReadyForQuery();
                         return true;
                     }
 
-                    // Multi-statement query detection is complex due to strings and comments.
-                    // A simple check can have false positives. For this MVP, we are omitting
-                    // the check, but a production system would need a more robust parser.
-
-                    const queryId = randomUUID();
-                    const job: Job = { schemaVersion: SCHEMA_VERSION, queryId, query, user: credentialsStore.user, password: credentialsStore.password };
-
-                    const resultPromise = new Promise<WorkerResult>((resolve) => {
-                        responseEmitter.once(queryId, resolve);
+                    // Set up the promise that will resolve when the 'complete' or 'error' message arrives.
+                    const queryDonePromise = new Promise<void>((resolve, reject) => {
+                        inFlightQuery = { isSchemaSent: false, resolve, reject };
                     });
 
-                    try {
-                        // --- Graceful Connect: Wait for WS to be open ---
-                        await waitWsOpen(ws);
+                    ws.send(JSON.stringify(job));
 
-                        const resultPromise = new Promise<WorkerResult>((resolve) => {
-                            responseEmitter.once(queryId, resolve);
-                        });
+                    await queryDonePromise;
 
-                        // --- Robustness: Query Timeout ---
-                        const timeoutPromise = new Promise<never>((_, reject) =>
-                            setTimeout(() => reject(new Error('Timed out waiting for worker response.')), QUERY_TIMEOUT_MS)
-                        );
-
-                        wsSendSafe(ws, job);
-                        const result = await Promise.race([resultPromise, timeoutPromise]);
-
-                        if (result.status === 'error') {
-                            connection.sendError({ severity: 'ERROR', code: result.payload.error?.code || 'XX000', message: result.payload.error?.message || 'An unknown error occurred.' });
-                        } else {
-                            const { columns, rows, commandTag } = result.payload;
-                            if (columns) {
-                                sendRowDescription(connection, columns);
-                                if (rows) rows.forEach((row) => sendDataRow(connection, row));
-                            }
-                            sendCommandComplete(connection, commandTag || 'SELECT 0');
-                        }
-                    } catch (err) {
-                        // This single catch block now handles errors from waitWsOpen, wsSendSafe, and the query timeout.
-                        connection.sendError({ severity: 'ERROR', code: PG_ERROR_CODES.QUERY_CANCELED, message: (err as Error).message });
-                    }
-
-                    connection.sendReadyForQuery();
+                    // The promise is resolved/rejected by the message handler, which also sends the final PG message.
+                    inFlightQuery = null;
                     return true;
                 }
                 return false;
             },
         });
 
-        // --- Robustness: Response Validation ---
         ws.on('message', (data) => {
-            let result: WorkerResult;
-            try {
-                result = JSON.parse(data.toString());
-                // Basic shape validation
-                if (!result?.queryId || !result?.status || !result?.payload || result.schemaVersion !== SCHEMA_VERSION) {
-                    console.error('[Gateway] Received invalid message from worker:', result);
-                    return;
-                }
-                responseEmitter.emit(result.queryId, result);
-            } catch (e) {
-                console.error('[Gateway] Failed to parse message from worker:', e);
+            if (!inFlightQuery) return; // Ignore messages if we're not expecting any.
+
+            const message: WorkerMessage = JSON.parse(data.toString());
+
+            switch (message.type) {
+                case 'schema':
+                    sendRowDescription(connection, (message.payload as WorkerSchema).columns);
+                    inFlightQuery.isSchemaSent = true;
+                    break;
+
+                case 'data':
+                    if (!inFlightQuery.isSchemaSent) {
+                        // Protocol violation
+                        const err = new Error('Worker sent data before schema.');
+                        connection.sendError({ severity: 'ERROR', code: 'XX000', message: err.message });
+                        inFlightQuery.reject(err);
+                    } else {
+                        (message.payload as WorkerData).forEach(row => sendDataRow(connection, row));
+                    }
+                    break;
+
+                case 'complete':
+                    sendCommandComplete(connection, (message.payload as WorkerComplete).commandTag);
+                    connection.sendReadyForQuery();
+                    inFlightQuery.resolve();
+                    break;
+
+                case 'error':
+                    const errorPayload = message.payload as WorkerError;
+                    connection.sendError({ severity: 'ERROR', code: errorPayload.code, message: errorPayload.message });
+                    connection.sendReadyForQuery();
+                    inFlightQuery.reject(new Error(errorPayload.message));
+                    break;
             }
         });
 
-        ws.on('close', () => {
-            console.log('[Gateway] WebSocket connection closed.');
-            clearInterval(pingInterval); // Graceful teardown
-            // Do NOT end the PG socket. The session remains alive.
-        });
-
-        ws.on('error', (err) => {
-            console.error('[Gateway] WebSocket error:', err);
-            clearInterval(pingInterval); // Graceful teardown
-            // Do not send a FATAL error or end the PG socket.
-            // Future queries will fail gracefully due to the readyState check.
-        });
-
-        socket.on('close', () => {
-             console.log('PG client disconnected.');
-             clearInterval(pingInterval); // Graceful teardown
-             if (ws.readyState === WebSocket.OPEN) ws.close();
-        });
-        socket.on('error', (err) => console.error('PG socket error:', err));
+        // Cleanup and error handling
+        const cleanup = () => {
+            if (inFlightQuery) {
+                inFlightQuery.reject(new Error('Connection closed unexpectedly.'));
+            }
+            if (ws.readyState === WebSocket.OPEN) ws.close();
+            if (!socket.destroyed) socket.end();
+        };
+        ws.on('close', cleanup);
+        ws.on('error', cleanup);
+        socket.on('close', cleanup);
+        socket.on('error', cleanup);
     });
 
     return server;
 }
 
-// --- Robustness: Backpressure Handling & Graceful Connect ---
-async function waitWsOpen(ws: WebSocket, ms = 2000): Promise<void> {
-    if (ws.readyState === WebSocket.OPEN) return;
-    if (ws.readyState !== WebSocket.CONNECTING) throw new Error('Worker socket is not connecting.');
-
-    return new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Timed out waiting for worker to connect.')), ms);
-        // Both 'open' and 'error' events should resolve the promise
-        const onOpen = () => {
-            clearTimeout(timeout);
-            ws.removeListener('error', onError);
-            resolve();
-        };
-        const onError = (err: Error) => {
-            clearTimeout(timeout);
-            ws.removeListener('open', onOpen);
-            reject(err);
-        };
-        ws.once('open', onOpen);
-        ws.once('error', onError);
-    });
-}
-
-function wsSendSafe(ws: WebSocket, payload: any) {
-    if (ws.readyState !== WebSocket.OPEN) {
-        // This should not be hit if waitWsOpen is used, but serves as a final guard.
-        throw new Error('Worker not connected');
-    }
-    if (ws.bufferedAmount > WS_MAX_BUFFERED_AMOUNT) {
-        console.error(`[Gateway] WebSocket backpressure limit exceeded (${ws.bufferedAmount} bytes).`);
-        throw new Error('Worker connection is overloaded.');
-    }
-    ws.send(JSON.stringify(payload));
-}
 
 // --- Protocol Helper Functions ---
 function sendRowDescription(conn: PostgresConnection, cols: { name: string; typeOID: number }[]) {
@@ -271,12 +202,4 @@ function sendCommandComplete(conn: PostgresConnection, tag: string) {
     const writer = new Writer();
     writer.addCString(tag);
     conn.sendData(writer.flush(MSG_CODE.COMMAND_COMPLETE));
-}
-
-// --- Standalone Execution ---
-if (require.main === module) {
-    const server = createGateway();
-    server.listen(PG_PORT, () => {
-        console.log(`PostgreSQL Gateway listening on port ${PG_PORT}`);
-    });
 }
